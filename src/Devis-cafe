@@ -1,0 +1,1581 @@
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    DATABASE_URL: str = "postgresql://cafe_user:cafe_pass@localhost:5432/cafe_db"
+    SECRET_KEY: str = "change_this_super_secret_key"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    REDIS_URL: str = "redis://localhost:6379/0"
+    ENV: str = "development"
+    PROJECT_NAME: str = "Devis Cafe"
+    API_V1_PREFIX: str = "/api/v1"
+
+    class Config:
+        env_file = ".env"
+
+
+settings = Settings()
+
+from datetime import datetime, timedelta
+from typing import Optional, Any
+
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+
+from app.core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(subject: str, role: str, extra: Optional[dict] = None) -> str:
+    expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode = {"sub": subject, "role": role, "exp": expire, "type": "access"}
+    if extra:
+        to_encode.update(extra)
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_refresh_token(subject: str) -> str:
+    expire = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode = {"sub": subject, "exp": expire, "type": "refresh"}
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def decode_token(token: str) -> Optional[dict]:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+from fastapi import Request, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+
+class AppException(Exception):
+    def __init__(self, status_code: int, message: str, details: dict | None = None):
+        self.status_code = status_code
+        self.message = message
+        self.details = details or {}
+
+
+class NotFoundException(AppException):
+    def __init__(self, message: str = "Resource not found"):
+        super().__init__(status.HTTP_404_NOT_FOUND, message)
+
+
+class ValidationException(AppException):
+    def __init__(self, message: str = "Validation error", details: dict | None = None):
+        super().__init__(status.HTTP_400_BAD_REQUEST, message, details)
+
+
+class UnauthorizedException(AppException):
+    def __init__(self, message: str = "Unauthorized"):
+        super().__init__(status.HTTP_401_UNAUTHORIZED, message)
+
+
+class ForbiddenException(AppException):
+    def __init__(self, message: str = "Forbidden: insufficient permissions"):
+        super().__init__(status.HTTP_403_FORBIDDEN, message)
+
+
+class ConflictException(AppException):
+    def __init__(self, message: str = "Conflict with current state"):
+        super().__init__(status.HTTP_409_CONFLICT, message)
+
+
+def register_exception_handlers(app):
+    @app.exception_handler(AppException)
+    async def app_exception_handler(request: Request, exc: AppException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"success": False, "message": exc.message, "details": exc.details},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "message": "Validation failed", "details": exc.errors()},
+        )
+
+    @app.exception_handler(IntegrityError)
+    async def integrity_error_handler(request: Request, exc: IntegrityError):
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"success": False, "message": "Database integrity error", "details": str(exc.orig)},
+        )
+
+    @app.exception_handler(SQLAlchemyError)
+    async def db_error_handler(request: Request, exc: SQLAlchemyError):
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": "Internal database error"},
+        )
+
+    @app.exception_handler(Exception)
+    async def generic_exception_handler(request: Request, exc: Exception):
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": "Internal server error"},
+        )
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+from app.core.config import settings
+
+engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+class MenuCategoryCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    description: Optional[str] = None
+
+
+class MenuCategoryUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class MenuCategoryOut(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class MenuItemCreate(BaseModel):
+    category_id: str
+    name: str = Field(min_length=2, max_length=150)
+    description: Optional[str] = None
+    price: float = Field(gt=0)
+    is_available: bool = True
+    image_url: Optional[str] = None
+
+
+class MenuItemUpdate(BaseModel):
+    category_id: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = Field(default=None, gt=0)
+    is_available: Optional[bool] = None
+    image_url: Optional[str] = None
+
+
+class MenuItemOut(BaseModel):
+    id: str
+    category_id: str
+    name: str
+    description: Optional[str] = None
+    price: float
+    is_available: bool
+    image_url: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel, Field
+
+from app.models.table import TableStatus, ReservationStatus
+
+
+class TableCreate(BaseModel):
+    table_number: str = Field(min_length=1, max_length=20)
+    capacity: int = Field(gt=0, default=2)
+
+
+class TableUpdate(BaseModel):
+    table_number: Optional[str] = None
+    capacity: Optional[int] = None
+    status: Optional[TableStatus] = None
+
+
+class TableOut(BaseModel):
+    id: str
+    table_number: str
+    capacity: int
+    status: TableStatus
+
+    class Config:
+        from_attributes = True
+
+
+class ReservationCreate(BaseModel):
+    table_id: str
+    customer_id: Optional[str] = None
+    customer_name: Optional[str] = None
+    customer_mobile: Optional[str] = None
+    party_size: int = Field(gt=0, default=2)
+    reservation_time: datetime
+
+
+class ReservationUpdate(BaseModel):
+    status: Optional[ReservationStatus] = None
+    reservation_time: Optional[datetime] = None
+    party_size: Optional[int] = None
+
+
+class ReservationOut(BaseModel):
+    id: str
+    table_id: str
+    customer_id: Optional[str] = None
+    customer_name: Optional[str] = None
+    customer_mobile: Optional[str] = None
+    party_size: int
+    reservation_time: datetime
+    status: ReservationStatus
+
+    class Config:
+        from_attributes = True
+from typing import Optional, List
+from pydantic import BaseModel, Field
+
+from app.models.order import OrderType, OrderStatus
+
+
+class OrderItemCreate(BaseModel):
+    menu_item_id: str
+    quantity: int = Field(gt=0)
+    special_instructions: Optional[str] = None
+
+
+class OrderCreate(BaseModel):
+    customer_id: Optional[str] = None
+    table_id: Optional[str] = None
+    order_type: OrderType
+    delivery_address: Optional[str] = None
+    notes: Optional[str] = None
+    items: List[OrderItemCreate] = Field(min_length=1)
+
+
+class OrderItemUpdate(BaseModel):
+    items: List[OrderItemCreate] = Field(min_length=1)
+
+
+class OrderStatusUpdate(BaseModel):
+    status: OrderStatus
+
+
+class OrderItemOut(BaseModel):
+    id: str
+    menu_item_id: str
+    quantity: int
+    unit_price: float
+    line_total: float
+    special_instructions: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class OrderOut(BaseModel):
+    id: str
+    order_number: str
+    customer_id: Optional[str] = None
+    table_id: Optional[str] = None
+    order_type: OrderType
+    status: OrderStatus
+    delivery_address: Optional[str] = None
+    subtotal: float
+    tax_amount: float
+    discount_amount: float
+    total_amount: float
+    notes: Optional[str] = None
+    items: List[OrderItemOut] = []
+
+    class Config:
+        from_attributes = True
+from typing import Optional
+from pydantic import BaseModel, Field
+
+from app.models.payment import PaymentMethod, PaymentStatus
+
+
+class BillPreviewRequest(BaseModel):
+    order_id: str
+    discount_amount: float = Field(default=0, ge=0)
+    tax_percent: float = Field(default=5.0, ge=0, le=100)  # GST default 5%
+
+
+class BillOut(BaseModel):
+    order_id: str
+    subtotal: float
+    discount_amount: float
+    tax_amount: float
+    total_amount: float
+
+
+class PaymentCreate(BaseModel):
+    order_id: str
+    method: PaymentMethod
+    amount: float = Field(gt=0)
+    transaction_ref: Optional[str] = None
+
+
+class PaymentOut(BaseModel):
+    id: str
+    order_id: str
+    amount: float
+    method: PaymentMethod
+    status: PaymentStatus
+    transaction_ref: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+class SupplierCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=150)
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    address: Optional[str] = None
+
+
+class SupplierUpdate(BaseModel):
+    name: Optional[str] = None
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    address: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class SupplierOut(BaseModel):
+    id: str
+    name: str
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    address: Optional[str] = None
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class InventoryItemCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=150)
+    unit: str = Field(min_length=1, max_length=30)
+    quantity_in_stock: float = Field(ge=0, default=0)
+    reorder_level: float = Field(ge=0, default=0)
+    unit_cost: float = Field(ge=0, default=0)
+    supplier_id: Optional[str] = None
+
+
+class InventoryItemUpdate(BaseModel):
+    name: Optional[str] = None
+    unit: Optional[str] = None
+    reorder_level: Optional[float] = None
+    unit_cost: Optional[float] = None
+    supplier_id: Optional[str] = None
+
+
+class InventoryAdjustment(BaseModel):
+    quantity_change: float = Field(description="Positive to add stock, negative to deduct")
+    reason: Optional[str] = None
+
+
+class InventoryItemOut(BaseModel):
+    id: str
+    name: str
+    unit: str
+    quantity_in_stock: float
+    reorder_level: float
+    unit_cost: float
+    supplier_id: Optional[str] = None
+    is_low_stock: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class MenuItemIngredientCreate(BaseModel):
+    menu_item_id: str
+    inventory_item_id: str
+    quantity_required: float = Field(gt=0)
+
+
+class MenuItemIngredientOut(BaseModel):
+    id: str
+    menu_item_id: str
+    inventory_item_id: str
+    quantity_required: float
+
+    class Config:
+        from_attributes = True
+from datetime import date, time
+from typing import Optional
+from pydantic import BaseModel
+
+
+class EmployeeCreate(BaseModel):
+    user_id: str
+    designation: Optional[str] = None
+
+
+class EmployeeOut(BaseModel):
+    id: str
+    user_id: str
+    designation: Optional[str] = None
+    date_joined: date
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class ClockInRequest(BaseModel):
+    employee_id: str
+
+
+class ClockOutRequest(BaseModel):
+    employee_id: str
+
+
+class AttendanceOut(BaseModel):
+    id: str
+    employee_id: str
+    work_date: date
+    clock_in: Optional[time] = None
+    clock_out: Optional[time] = None
+
+    class Config:
+        from_attributes = True
+from sqlalchemy.orm import Session
+from app.models.user import AuditLog
+
+
+def write_audit_log(db: Session, user_id: str | None, action: str, entity: str, entity_id: str | None = None, details: str | None = None):
+    log = AuditLog(user_id=user_id, action=action, entity=entity, entity_id=entity_id, details=details)
+    db.add(log)
+import random
+import string
+from datetime import datetime
+
+
+def generate_order_number() -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    suffix = "".join(random.choices(string.digits, k=4))
+    return f"ORD-{ts}-{suffix}"
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+
+from app.models.user import User
+from app.schemas.auth import UserCreate, LoginRequest
+from app.core.security import hash_password, verify_password, create_access_token, create_refresh_token, decode_token
+from app.core.exceptions import ValidationException, UnauthorizedException, NotFoundException
+from app.utils.audit import write_audit_log
+
+
+def register_user(db: Session, payload: UserCreate) -> User:
+    existing = db.query(User).filter(
+        or_(User.email == payload.email, User.mobile == payload.mobile)
+    ).first()
+    if existing:
+        raise ValidationException("A user with this email or mobile already exists")
+
+    user = User(
+        full_name=payload.full_name,
+        email=payload.email,
+        mobile=payload.mobile,
+        hashed_password=hash_password(payload.password),
+        role=payload.role,
+    )
+    db.add(user)
+    db.flush()
+    write_audit_log(db, user.id, "USER_REGISTERED", "User", user.id)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def authenticate_user(db: Session, payload: LoginRequest) -> tuple[str, str]:
+    user = db.query(User).filter(User.email == payload.email).first()
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise UnauthorizedException("Invalid email or password")
+    if not user.is_active:
+        raise UnauthorizedException("User account is inactive")
+
+    access_token = create_access_token(subject=user.id, role=user.role.value)
+    refresh_token = create_refresh_token(subject=user.id)
+    write_audit_log(db, user.id, "USER_LOGIN", "User", user.id)
+    db.commit()
+    return access_token, refresh_token
+
+
+def refresh_access_token(db: Session, refresh_token: str) -> str:
+    payload = decode_token(refresh_token)
+    if not payload or payload.get("type") != "refresh":
+        raise UnauthorizedException("Invalid or expired refresh token")
+    user = db.get(User, payload.get("sub"))
+    if not user or not user.is_active:
+        raise NotFoundException("User not found or inactive")
+    return create_access_token(subject=user.id, role=user.role.value)
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.schemas.auth import UserCreate, UserOut, LoginRequest, TokenResponse, RefreshRequest
+from app.schemas.common import SuccessResponse
+from app.services import auth_service
+from app.core.deps import get_current_user, require_roles
+from app.models.user import User, RoleEnum
+
+router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+@router.post("/register", response_model=SuccessResponse[UserOut])
+def register(
+    payload: UserCreate,
+    db: Session = Depends(get_db),
+    # Only Owner/Manager may create new staff accounts; first Owner must be seeded via script.
+    current_user: User = Depends(require_roles(RoleEnum.OWNER, RoleEnum.MANAGER)),
+):
+    user = auth_service.register_user(db, payload)
+    return SuccessResponse(message="User registered successfully", data=UserOut.model_validate(user))
+
+
+@router.post("/login", response_model=SuccessResponse[TokenResponse])
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    access_token, refresh_token = auth_service.authenticate_user(db, payload)
+    return SuccessResponse(
+        message="Login successful",
+        data=TokenResponse(access_token=access_token, refresh_token=refresh_token),
+    )
+
+
+@router.post("/refresh", response_model=SuccessResponse[dict])
+def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
+    access_token = auth_service.refresh_access_token(db, payload.refresh_token)
+    return SuccessResponse(message="Token refreshed", data={"access_token": access_token, "token_type": "bearer"})
+
+
+@router.get("/me", response_model=SuccessResponse[UserOut])
+def me(current_user: User = Depends(get_current_user)):
+    return SuccessResponse(data=UserOut.model_validate(current_user))
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+
+from app.models.customer import Customer, CustomerLoyaltyTransaction, LoyaltyTxnType
+from app.schemas.customer import CustomerCreate, CustomerUpdate
+from app.core.exceptions import ValidationException, NotFoundException
+
+
+def create_customer(db: Session, payload: CustomerCreate) -> Customer:
+    existing = db.query(Customer).filter(
+        or_(Customer.mobile == payload.mobile, Customer.email == payload.email if payload.email else False)
+    ).first()
+    if existing:
+        raise ValidationException("Customer with this mobile or email already exists")
+
+    customer = Customer(full_name=payload.full_name, email=payload.email, mobile=payload.mobile)
+    db.add(customer)
+    db.commit()
+    db.refresh(customer)
+    return customer
+
+
+def get_customer(db: Session, customer_id: str) -> Customer:
+    customer = db.get(Customer, customer_id)
+    if not customer:
+        raise NotFoundException("Customer not found")
+    return customer
+
+
+def list_customers(db: Session, page: int, page_size: int, search: str | None = None):
+    query = db.query(Customer)
+    if search:
+        like = f"%{search}%"
+        query = query.filter(or_(Customer.full_name.ilike(like), Customer.mobile.ilike(like), Customer.email.ilike(like)))
+    total = query.count()
+    items = query.order_by(Customer.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return items, total
+
+
+def update_customer(db: Session, customer_id: str, payload: CustomerUpdate) -> Customer:
+    customer = get_customer(db, customer_id)
+    update_data = payload.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(customer, field, value)
+    db.commit()
+    db.refresh(customer)
+    return customer
+
+
+def get_order_history(db: Session, customer_id: str):
+    customer = get_customer(db, customer_id)
+    return customer.orders
+
+
+def award_loyalty_points(db: Session, customer_id: str, points: int, order_id: str):
+    """Business Rule: Loyalty points awarded only after successful payment."""
+    customer = get_customer(db, customer_id)
+    customer.loyalty_points += points
+    txn = CustomerLoyaltyTransaction(
+        customer_id=customer_id,
+        points=points,
+        txn_type=LoyaltyTxnType.EARNED,
+        reference_order_id=order_id,
+        note="Earned from order payment",
+    )
+    db.add(txn)
+    # caller is responsible for commit (keeps payment + loyalty atomic)
+
+
+def redeem_loyalty_points(db: Session, customer_id: str, points: int) -> Customer:
+    customer = get_customer(db, customer_id)
+    if customer.loyalty_points < points:
+        raise ValidationException("Insufficient loyalty points")
+    customer.loyalty_points -= points
+    txn = CustomerLoyaltyTransaction(
+        customer_id=customer_id, points=points, txn_type=LoyaltyTxnType.REDEEMED, note="Redeemed by customer"
+    )
+    db.add(txn)
+    db.commit()
+    db.refresh(customer)
+    return customer
+from typing import Optional
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.schemas.customer import CustomerCreate, CustomerUpdate, CustomerOut
+from app.schemas.common import SuccessResponse, PaginatedResponse
+from app.schemas.order import OrderOut
+from app.services import customer_service
+from app.core.deps import get_current_user, require_any_staff
+
+router = APIRouter(prefix="/customers", tags=["Customer Management"])
+
+
+@router.post("", response_model=SuccessResponse[CustomerOut], dependencies=[Depends(require_any_staff)])
+def create_customer(payload: CustomerCreate, db: Session = Depends(get_db)):
+    customer = customer_service.create_customer(db, payload)
+    return SuccessResponse(message="Customer registered", data=CustomerOut.model_validate(customer))
+
+
+@router.get("", response_model=PaginatedResponse[CustomerOut], dependencies=[Depends(require_any_staff)])
+def list_customers(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    items, total = customer_service.list_customers(db, page, page_size, search)
+    return PaginatedResponse(total=total, page=page, page_size=page_size, items=[CustomerOut.model_validate(i) for i in items])
+
+
+@router.get("/{customer_id}", response_model=SuccessResponse[CustomerOut], dependencies=[Depends(require_any_staff)])
+def get_customer(customer_id: str, db: Session = Depends(get_db)):
+    customer = customer_service.get_customer(db, customer_id)
+    return SuccessResponse(data=CustomerOut.model_validate(customer))
+
+
+@router.put("/{customer_id}", response_model=SuccessResponse[CustomerOut], dependencies=[Depends(require_any_staff)])
+def update_customer(customer_id: str, payload: CustomerUpdate, db: Session = Depends(get_db)):
+    customer = customer_service.update_customer(db, customer_id, payload)
+    return SuccessResponse(message="Customer updated", data=CustomerOut.model_validate(customer))
+
+
+@router.get("/{customer_id}/orders", response_model=SuccessResponse[list[OrderOut]], dependencies=[Depends(require_any_staff)])
+def order_history(customer_id: str, db: Session = Depends(get_db)):
+    orders = customer_service.get_order_history(db, customer_id)
+    return SuccessResponse(data=[OrderOut.model_validate(o) for o in orders])
+
+
+@router.post("/{customer_id}/redeem-points", response_model=SuccessResponse[CustomerOut], dependencies=[Depends(require_any_staff)])
+def redeem_points(customer_id: str, points: int = Query(gt=0), db: Session = Depends(get_db)):
+    customer = customer_service.redeem_loyalty_points(db, customer_id, points)
+    return SuccessResponse(message="Points redeemed", data=CustomerOut.model_validate(customer))
+from sqlalchemy.orm import Session
+
+from app.models.menu import MenuCategory, MenuItem
+from app.models.user import User, RoleEnum
+from app.schemas.menu import MenuCategoryCreate, MenuCategoryUpdate, MenuItemCreate, MenuItemUpdate
+from app.core.exceptions import NotFoundException, ValidationException, ForbiddenException
+from app.utils.audit import write_audit_log
+
+
+# ---------------- Categories ----------------
+
+def create_category(db: Session, payload: MenuCategoryCreate) -> MenuCategory:
+    existing = db.query(MenuCategory).filter(MenuCategory.name == payload.name, MenuCategory.is_deleted == False).first()
+    if existing:
+        raise ValidationException("Category with this name already exists")
+    category = MenuCategory(name=payload.name, description=payload.description)
+    db.add(category)
+    db.commit()
+    db.refresh(category)
+    return category
+
+
+def list_categories(db: Session):
+    return db.query(MenuCategory).filter(MenuCategory.is_deleted == False).order_by(MenuCategory.name).all()
+
+
+def get_category(db: Session, category_id: str) -> MenuCategory:
+    category = db.query(MenuCategory).filter(MenuCategory.id == category_id, MenuCategory.is_deleted == False).first()
+    if not category:
+        raise NotFoundException("Menu category not found")
+    return category
+
+
+def update_category(db: Session, category_id: str, payload: MenuCategoryUpdate) -> MenuCategory:
+    category = get_category(db, category_id)
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(category, field, value)
+    db.commit()
+    db.refresh(category)
+    return category
+
+
+def delete_category(db: Session, category_id: str):
+    category = get_category(db, category_id)
+    category.is_deleted = True
+    db.commit()
+
+
+# ---------------- Menu Items ----------------
+
+def create_item(db: Session, payload: MenuItemCreate, current_user: User) -> MenuItem:
+    get_category(db, payload.category_id)  # ensures category exists
+    item = MenuItem(**payload.model_dump())
+    db.add(item)
+    db.flush()
+    write_audit_log(db, current_user.id, "MENU_ITEM_CREATED", "MenuItem", item.id, f"price={item.price}")
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def list_items(db: Session, category_id: str | None = None, only_available: bool = False):
+    query = db.query(MenuItem).filter(MenuItem.is_deleted == False)
+    if category_id:
+        query = query.filter(MenuItem.category_id == category_id)
+    if only_available:
+        query = query.filter(MenuItem.is_available == True)
+    return query.order_by(MenuItem.name).all()
+
+
+def get_item(db: Session, item_id: str) -> MenuItem:
+    item = db.query(MenuItem).filter(MenuItem.id == item_id, MenuItem.is_deleted == False).first()
+    if not item:
+        raise NotFoundException("Menu item not found")
+    return item
+
+
+def update_item(db: Session, item_id: str, payload: MenuItemUpdate, current_user: User) -> MenuItem:
+    """Business Rule: Only Managers and Owners can modify menu prices."""
+    item = get_item(db, item_id)
+    update_data = payload.model_dump(exclude_unset=True)
+
+    if "price" in update_data and update_data["price"] is not None:
+        if current_user.role not in (RoleEnum.OWNER, RoleEnum.MANAGER):
+            raise ForbiddenException("Only Managers and Owners can modify menu prices")
+        write_audit_log(
+            db, current_user.id, "MENU_PRICE_CHANGED", "MenuItem", item.id,
+            f"old_price={item.price}, new_price={update_data['price']}"
+        )
+
+    for field, value in update_data.items():
+        setattr(item, field, value)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def delete_item(db: Session, item_id: str, current_user: User):
+    item = get_item(db, item_id)
+    item.is_deleted = True
+    write_audit_log(db, current_user.id, "MENU_ITEM_DELETED", "MenuItem", item.id)
+    db.commit()
+
+
+def set_availability(db: Session, item_id: str, is_available: bool) -> MenuItem:
+    item = get_item(db, item_id)
+    item.is_available = is_available
+    db.commit()
+    db.refresh(item)
+    return item
+from typing import Optional
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.schemas.menu import (
+    MenuCategoryCreate, MenuCategoryUpdate, MenuCategoryOut,
+    MenuItemCreate, MenuItemUpdate, MenuItemOut,
+)
+from app.schemas.common import SuccessResponse
+from app.services import menu_service
+from app.core.deps import get_current_user, require_owner_or_manager, require_any_staff
+from app.models.user import User
+
+router = APIRouter(prefix="/menu", tags=["Menu Management"])
+
+
+# Categories
+@router.post("/categories", response_model=SuccessResponse[MenuCategoryOut], dependencies=[Depends(require_owner_or_manager)])
+def create_category(payload: MenuCategoryCreate, db: Session = Depends(get_db)):
+    category = menu_service.create_category(db, payload)
+    return SuccessResponse(message="Category created", data=MenuCategoryOut.model_validate(category))
+
+
+@router.get("/categories", response_model=SuccessResponse[list[MenuCategoryOut]])
+def list_categories(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    categories = menu_service.list_categories(db)
+    return SuccessResponse(data=[MenuCategoryOut.model_validate(c) for c in categories])
+
+
+@router.put("/categories/{category_id}", response_model=SuccessResponse[MenuCategoryOut], dependencies=[Depends(require_owner_or_manager)])
+def update_category(category_id: str, payload: MenuCategoryUpdate, db: Session = Depends(get_db)):
+    category = menu_service.update_category(db, category_id, payload)
+    return SuccessResponse(message="Category updated", data=MenuCategoryOut.model_validate(category))
+
+
+@router.delete("/categories/{category_id}", response_model=SuccessResponse[None], dependencies=[Depends(require_owner_or_manager)])
+def delete_category(category_id: str, db: Session = Depends(get_db)):
+    menu_service.delete_category(db, category_id)
+    return SuccessResponse(message="Category deleted")
+
+
+# Items
+@router.post("/items", response_model=SuccessResponse[MenuItemOut], dependencies=[Depends(require_owner_or_manager)])
+def create_item(payload: MenuItemCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    item = menu_service.create_item(db, payload, current_user)
+    return SuccessResponse(message="Menu item created", data=MenuItemOut.model_validate(item))
+
+
+@router.get("/items", response_model=SuccessResponse[list[MenuItemOut]])
+def list_items(
+    category_id: Optional[str] = None,
+    only_available: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    items = menu_service.list_items(db, category_id, only_available)
+    return SuccessResponse(data=[MenuItemOut.model_validate(i) for i in items])
+
+
+@router.get("/items/{item_id}", response_model=SuccessResponse[MenuItemOut])
+def get_item(item_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    item = menu_service.get_item(db, item_id)
+    return SuccessResponse(data=MenuItemOut.model_validate(item))
+
+
+@router.put("/items/{item_id}", response_model=SuccessResponse[MenuItemOut], dependencies=[Depends(require_any_staff)])
+def update_item(item_id: str, payload: MenuItemUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # Note: price changes are further restricted to Owner/Manager inside the service layer (business rule).
+    item = menu_service.update_item(db, item_id, payload, current_user)
+    return SuccessResponse(message="Menu item updated", data=MenuItemOut.model_validate(item))
+
+
+@router.delete("/items/{item_id}", response_model=SuccessResponse[None], dependencies=[Depends(require_owner_or_manager)])
+def delete_item(item_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    menu_service.delete_item(db, item_id, current_user)
+    return SuccessResponse(message="Menu item deleted")
+
+
+@router.patch("/items/{item_id}/availability", response_model=SuccessResponse[MenuItemOut], dependencies=[Depends(require_any_staff)])
+def set_availability(item_id: str, is_available: bool, db: Session = Depends(get_db)):
+    item = menu_service.set_availability(db, item_id, is_available)
+    return SuccessResponse(message="Availability updated", data=MenuItemOut.model_validate(item))
+from sqlalchemy.orm import Session
+
+from app.models.inventory import Supplier, InventoryItem, MenuItemIngredient
+from app.schemas.inventory import (
+    SupplierCreate, SupplierUpdate, InventoryItemCreate, InventoryItemUpdate,
+    InventoryAdjustment, MenuItemIngredientCreate,
+)
+from app.core.exceptions import NotFoundException, ValidationException
+
+
+# ---------------- Suppliers ----------------
+
+def create_supplier(db: Session, payload: SupplierCreate) -> Supplier:
+    supplier = Supplier(**payload.model_dump())
+    db.add(supplier)
+    db.commit()
+    db.refresh(supplier)
+    return supplier
+
+
+def list_suppliers(db: Session):
+    return db.query(Supplier).filter(Supplier.is_active == True).order_by(Supplier.name).all()
+
+
+def get_supplier(db: Session, supplier_id: str) -> Supplier:
+    supplier = db.get(Supplier, supplier_id)
+    if not supplier:
+        raise NotFoundException("Supplier not found")
+    return supplier
+
+
+def update_supplier(db: Session, supplier_id: str, payload: SupplierUpdate) -> Supplier:
+    supplier = get_supplier(db, supplier_id)
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(supplier, field, value)
+    db.commit()
+    db.refresh(supplier)
+    return supplier
+
+
+# ---------------- Inventory Items ----------------
+
+def create_inventory_item(db: Session, payload: InventoryItemCreate) -> InventoryItem:
+    if payload.supplier_id:
+        get_supplier(db, payload.supplier_id)
+    item = InventoryItem(**payload.model_dump())
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def list_inventory_items(db: Session, low_stock_only: bool = False):
+    items = db.query(InventoryItem).order_by(InventoryItem.name).all()
+    if low_stock_only:
+        items = [i for i in items if i.quantity_in_stock <= i.reorder_level]
+    return items
+
+
+def get_inventory_item(db: Session, item_id: str) -> InventoryItem:
+    item = db.get(InventoryItem, item_id)
+    if not item:
+        raise NotFoundException("Inventory item not found")
+    return item
+
+
+def update_inventory_item(db: Session, item_id: str, payload: InventoryItemUpdate) -> InventoryItem:
+    item = get_inventory_item(db, item_id)
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(item, field, value)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def adjust_stock(db: Session, item_id: str, payload: InventoryAdjustment) -> InventoryItem:
+    item = get_inventory_item(db, item_id)
+    new_qty = float(item.quantity_in_stock) + payload.quantity_change
+    if new_qty < 0:
+        raise ValidationException("Stock cannot go negative")
+    item.quantity_in_stock = new_qty
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def get_low_stock_alerts(db: Session):
+    return list_inventory_items(db, low_stock_only=True)
+
+
+# ---------------- Menu <-> Inventory recipe linking ----------------
+
+def link_ingredient(db: Session, payload: MenuItemIngredientCreate) -> MenuItemIngredient:
+    get_inventory_item(db, payload.inventory_item_id)
+    link = MenuItemIngredient(**payload.model_dump())
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    return link
+
+
+def deduct_inventory_for_order(db: Session, order_items: list):
+    """
+    Business Rule: Inventory updates automatically after order completion.
+    Deducts stock based on menu item recipes (MenuItemIngredient) for each order item.
+    """
+    for order_item in order_items:
+        links = db.query(MenuItemIngredient).filter(
+            MenuItemIngredient.menu_item_id == order_item.menu_item_id
+        ).all()
+        for link in links:
+            inv_item = db.get(InventoryItem, link.inventory_item_id)
+            if inv_item:
+                required = float(link.quantity_required) * order_item.quantity
+                inv_item.quantity_in_stock = max(0.0, float(inv_item.quantity_in_stock) - required)
+    # caller commits as part of the larger transaction
+
+
+def validate_stock_availability(db: Session, menu_item_id: str, quantity: int) -> bool:
+    """Checks if enough inventory exists to prepare `quantity` of a menu item."""
+    links = db.query(MenuItemIngredient).filter(MenuItemIngredient.menu_item_id == menu_item_id).all()
+    for link in links:
+        inv_item = db.get(InventoryItem, link.inventory_item_id)
+        if not inv_item:
+            continue
+        required = float(link.quantity_required) * quantity
+        if float(inv_item.quantity_in_stock) < required:
+            return False
+    return True
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.schemas.inventory import (
+    SupplierCreate, SupplierUpdate, SupplierOut,
+    InventoryItemCreate, InventoryItemUpdate, InventoryItemOut, InventoryAdjustment,
+    MenuItemIngredientCreate, MenuItemIngredientOut,
+)
+from app.schemas.common import SuccessResponse
+from app.services import inventory_service
+from app.core.deps import get_current_user, require_inventory_staff, require_owner_or_manager
+
+router = APIRouter(prefix="/inventory", tags=["Inventory Management"])
+
+
+def _to_out(item) -> InventoryItemOut:
+    out = InventoryItemOut.model_validate(item)
+    out.is_low_stock = float(item.quantity_in_stock) <= float(item.reorder_level)
+    return out
+
+
+# Suppliers
+@router.post("/suppliers", response_model=SuccessResponse[SupplierOut], dependencies=[Depends(require_inventory_staff)])
+def create_supplier(payload: SupplierCreate, db: Session = Depends(get_db)):
+    supplier = inventory_service.create_supplier(db, payload)
+    return SuccessResponse(message="Supplier created", data=SupplierOut.model_validate(supplier))
+
+
+@router.get("/suppliers", response_model=SuccessResponse[list[SupplierOut]])
+def list_suppliers(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    suppliers = inventory_service.list_suppliers(db)
+    return SuccessResponse(data=[SupplierOut.model_validate(s) for s in suppliers])
+
+
+@router.put("/suppliers/{supplier_id}", response_model=SuccessResponse[SupplierOut], dependencies=[Depends(require_inventory_staff)])
+def update_supplier(supplier_id: str, payload: SupplierUpdate, db: Session = Depends(get_db)):
+    supplier = inventory_service.update_supplier(db, supplier_id, payload)
+    return SuccessResponse(message="Supplier updated", data=SupplierOut.model_validate(supplier))
+
+
+# Inventory Items
+@router.post("/items", response_model=SuccessResponse[InventoryItemOut], dependencies=[Depends(require_inventory_staff)])
+def create_item(payload: InventoryItemCreate, db: Session = Depends(get_db)):
+    item = inventory_service.create_inventory_item(db, payload)
+    return SuccessResponse(message="Inventory item created", data=_to_out(item))
+
+
+@router.get("/items", response_model=SuccessResponse[list[InventoryItemOut]])
+def list_items(low_stock_only: bool = False, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    items = inventory_service.list_inventory_items(db, low_stock_only)
+    return SuccessResponse(data=[_to_out(i) for i in items])
+
+
+@router.put("/items/{item_id}", response_model=SuccessResponse[InventoryItemOut], dependencies=[Depends(require_inventory_staff)])
+def update_item(item_id: str, payload: InventoryItemUpdate, db: Session = Depends(get_db)):
+    item = inventory_service.update_inventory_item(db, item_id, payload)
+    return SuccessResponse(message="Inventory item updated", data=_to_out(item))
+
+
+@router.post("/items/{item_id}/adjust", response_model=SuccessResponse[InventoryItemOut], dependencies=[Depends(require_inventory_staff)])
+def adjust_stock(item_id: str, payload: InventoryAdjustment, db: Session = Depends(get_db)):
+    item = inventory_service.adjust_stock(db, item_id, payload)
+    return SuccessResponse(message="Stock adjusted", data=_to_out(item))
+
+
+@router.get("/low-stock-alerts", response_model=SuccessResponse[list[InventoryItemOut]])
+def low_stock_alerts(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    items = inventory_service.get_low_stock_alerts(db)
+    return SuccessResponse(data=[_to_out(i) for i in items])
+
+
+# Recipe linking
+@router.post("/recipe-link", response_model=SuccessResponse[MenuItemIngredientOut], dependencies=[Depends(require_owner_or_manager)])
+def link_ingredient(payload: MenuItemIngredientCreate, db: Session = Depends(get_db)):
+    link = inventory_service.link_ingredient(db, payload)
+    return SuccessResponse(message="Recipe link created", data=MenuItemIngredientOut.model_validate(link))
+from sqlalchemy.orm import Session
+
+from app.models.order import Order, OrderItem, OrderStatus, OrderType
+from app.models.menu import MenuItem
+from app.models.table import CafeTable, TableStatus
+from app.schemas.order import OrderCreate, OrderItemUpdate, OrderStatusUpdate
+from app.core.exceptions import NotFoundException, ValidationException, ConflictException
+from app.utils.generators import generate_order_number
+from app.services import inventory_service
+from app.utils.audit import write_audit_log
+
+# Allowed forward transitions for order status (prevents invalid jumps, e.g. Pending -> Completed)
+VALID_TRANSITIONS = {
+    OrderStatus.PENDING: {OrderStatus.CONFIRMED, OrderStatus.CANCELLED},
+    OrderStatus.CONFIRMED: {OrderStatus.PREPARING, OrderStatus.CANCELLED},
+    OrderStatus.PREPARING: {OrderStatus.READY, OrderStatus.CANCELLED},
+    OrderStatus.READY: {OrderStatus.COMPLETED, OrderStatus.CANCELLED},
+    OrderStatus.COMPLETED: set(),
+    OrderStatus.CANCELLED: set(),
+}
+
+
+def _calc_totals(order: Order, tax_percent: float = 5.0, discount_amount: float = 0.0):
+    subtotal = sum(float(i.line_total) for i in order.items)
+    tax_amount = round(subtotal * (tax_percent / 100), 2)
+    order.subtotal = subtotal
+    order.tax_amount = tax_amount
+    order.discount_amount = discount_amount
+    order.total_amount = round(subtotal + tax_amount - discount_amount, 2)
+
+
+def create_order(db: Session, payload: OrderCreate, current_user) -> Order:
+    if payload.order_type == OrderType.DINE_IN and not payload.table_id:
+        raise ValidationException("table_id is required for dine-in orders")
+    if payload.order_type == OrderType.DELIVERY and not payload.delivery_address:
+        raise ValidationException("delivery_address is required for delivery orders")
+
+    order = Order(
+        order_number=generate_order_number(),
+        customer_id=payload.customer_id,
+        table_id=payload.table_id,
+        created_by=current_user.id,
+        order_type=payload.order_type,
+        delivery_address=payload.delivery_address,
+        notes=payload.notes,
+        status=OrderStatus.PENDING,
+    )
+    db.add(order)
+    db.flush()
+
+    for line in payload.items:
+        menu_item = db.get(MenuItem, line.menu_item_id)
+        if not menu_item or menu_item.is_deleted:
+            raise NotFoundException(f"Menu item {line.menu_item_id} not found")
+        if not menu_item.is_available:
+            raise ValidationException(f"Menu item '{menu_item.name}' is currently unavailable")
+        if not inventory_service.validate_stock_availability(db, menu_item.id, line.quantity):
+            raise ValidationException(f"Insufficient stock to prepare '{menu_item.name}'")
+
+        order_item = OrderItem(
+            order_id=order.id,
+            menu_item_id=menu_item.id,
+            quantity=line.quantity,
+            unit_price=menu_item.price,
+            line_total=float(menu_item.price) * line.quantity,
+            special_instructions=line.special_instructions,
+        )
+        db.add(order_item)
+
+    db.flush()
+    db.refresh(order)
+    _calc_totals(order)
+
+    if order.order_type == OrderType.DINE_IN and order.table_id:
+        table = db.get(CafeTable, order.table_id)
+        if table:
+            table.status = TableStatus.OCCUPIED
+
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def get_order(db: Session, order_id: str) -> Order:
+    order = db.get(Order, order_id)
+    if not order:
+        raise NotFoundException("Order not found")
+    return order
+
+
+def list_orders(db: Session, status: OrderStatus | None = None, order_type: OrderType | None = None, page: int = 1, page_size: int = 20):
+    query = db.query(Order)
+    if status:
+        query = query.filter(Order.status == status)
+    if order_type:
+        query = query.filter(Order.order_type == order_type)
+    total = query.count()
+    items = query.order_by(Order.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return items, total
+
+
+def modify_order_items(db: Session, order_id: str, payload: OrderItemUpdate) -> Order:
+    order = get_order(db, order_id)
+    if order.status not in (OrderStatus.PENDING, OrderStatus.CONFIRMED):
+        raise ConflictException("Order can only be modified while Pending or Confirmed")
+
+    # remove old items, replace with new set
+    for old_item in list(order.items):
+        db.delete(old_item)
+    db.flush()
+
+    for line in payload.items:
+        menu_item = db.get(MenuItem, line.menu_item_id)
+        if not menu_item or menu_item.is_deleted:
+            raise NotFoundException(f"Menu item {line.menu_item_id} not found")
+        if not inventory_service.validate_stock_availability(db, menu_item.id, line.quantity):
+            raise ValidationException(f"Insufficient stock to prepare '{menu_item.name}'")
+        order_item = OrderItem(
+            order_id=order.id,
+            menu_item_id=menu_item.id,
+            quantity=line.quantity,
+            unit_price=menu_item.price,
+            line_total=float(menu_item.price) * line.quantity,
+            special_instructions=line.special_instructions,
+        )
+        db.add(order_item)
+
+    db.flush()
+    db.refresh(order)
+    _calc_totals(order)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def update_order_status(db: Session, order_id: str, payload: OrderStatusUpdate, current_user) -> Order:
+    """Business Rule: Orders must be confirmed before preparation."""
+    order = get_order(db, order_id)
+    allowed_next = VALID_TRANSITIONS.get(order.status, set())
+    if payload.status not in allowed_next:
+        raise ConflictException(f"Cannot transition order from {order.status} to {payload.status}")
+
+    order.status = payload.status
+
+    if payload.status == OrderStatus.COMPLETED:
+        # Inventory updates automatically after order completion.
+        inventory_service.deduct_inventory_for_order(db, order.items)
+        if order.table_id:
+            table = db.get(CafeTable, order.table_id)
+            if table:
+                table.status = TableStatus.CLEANING
+
+    if payload.status == OrderStatus.CANCELLED and order.table_id:
+        table = db.get(CafeTable, order.table_id)
+        if table and table.status == TableStatus.OCCUPIED:
+            table.status = TableStatus.AVAILABLE
+
+    write_audit_log(db, current_user.id, "ORDER_STATUS_CHANGED", "Order", order.id, f"new_status={payload.status}")
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def cancel_order(db: Session, order_id: str, current_user) -> Order:
+    return update_order_status(db, order_id, OrderStatusUpdate(status=OrderStatus.CANCELLED), current_user)
+from typing import Optional
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.schemas.order import OrderCreate, OrderItemUpdate, OrderStatusUpdate, OrderOut
+from app.schemas.common import SuccessResponse, PaginatedResponse
+from app.services import order_service
+from app.core.deps import get_current_user, require_order_staff, require_kitchen_staff
+from app.models.order import OrderStatus, OrderType
+from app.models.user import User
+
+router = APIRouter(prefix="/orders", tags=["Order Management"])
+
+
+@router.post("", response_model=SuccessResponse[OrderOut], dependencies=[Depends(require_order_staff)])
+def create_order(payload: OrderCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    order = order_service.create_order(db, payload, current_user)
+    return SuccessResponse(message="Order created", data=OrderOut.model_validate(order))
+
+
+@router.get("", response_model=PaginatedResponse[OrderOut])
+def list_orders(
+    status: Optional[OrderStatus] = None,
+    order_type: Optional[OrderType] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    items, total = order_service.list_orders(db, status, order_type, page, page_size)
+    return PaginatedResponse(total=total, page=page, page_size=page_size, items=[OrderOut.model_validate(o) for o in items])
+
+
+@router.get("/{order_id}", response_model=SuccessResponse[OrderOut])
+def get_order(order_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    order = order_service.get_order(db, order_id)
+    return SuccessResponse(data=OrderOut.model_validate(order))
+
+
+@router.put("/{order_id}/items", response_model=SuccessResponse[OrderOut], dependencies=[Depends(require_order_staff)])
+def modify_order_items(order_id: str, payload: OrderItemUpdate, db: Session = Depends(get_db)):
+    order = order_service.modify_order_items(db, order_id, payload)
+    return SuccessResponse(message="Order items updated", data=OrderOut.model_validate(order))
+
+
+@router.patch("/{order_id}/status", response_model=SuccessResponse[OrderOut], dependencies=[Depends(require_kitchen_staff)])
+def update_status(order_id: str, payload: OrderStatusUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    order = order_service.update_order_status(db, order_id, payload, current_user)
+    return SuccessResponse(message="Order status updated", data=OrderOut.model_validate(order))
+
+
+@router.post("/{order_id}/cancel", response_model=SuccessResponse[OrderOut], dependencies=[Depends(require_order_staff)])
+def cancel_order(order_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    order = order_service.cancel_order(db, order_id, current_user)
+    return SuccessResponse(message="Order cancelled", data=OrderOut.model_validate(order))
+from sqlalchemy.orm import Session
+
+from app.models.order import Order, OrderStatus
+from app.models.payment import Payment, PaymentStatus
+from app.schemas.billing import BillPreviewRequest, PaymentCreate
+from app.core.exceptions import NotFoundException, ValidationException, ConflictException
+from app.services import order_service, customer_service, inventory_service
+from app.utils.audit import write_audit_log
+
+LOYALTY_POINTS_PER_100 = 5  # 5 points earned per 100 currency units spent
+
+
+def preview_bill(db: Session, payload: BillPreviewRequest) -> Order:
+    order = order_service.get_order(db, payload.order_id)
+    subtotal = float(order.subtotal)
+    tax_amount = round(subtotal * (payload.tax_percent / 100), 2)
+    order.tax_amount = tax_amount
+    order.discount_amount = payload.discount_amount
+    order.total_amount = round(subtotal + tax_amount - payload.discount_amount, 2)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def process_payment(db: Session, payload: PaymentCreate, current_user) -> Payment:
+    order = order_service.get_order(db, payload.order_id)
+
+    if order.status == OrderStatus.CANCELLED:
+        raise ConflictException("Cannot pay for a cancelled order")
+    if order.payment and order.payment.status == PaymentStatus.SUCCESS:
+        raise ConflictException("Order is already paid")
+
+    if round(float(payload.amount), 2) != round(float(order.total_amount), 2):
+        raise ValidationException(
+            f"Payment amount ({payload.amount}) does not match order total ({order.total_amount})"
+        )
+
+    payment = order.payment
+    if payment:
+        payment.amount = payload.amount
+        payment.method = payload.method
+        payment.transaction_ref = payload.transaction_ref
+        payment.status = PaymentStatus.SUCCESS
+    else:
+        payment = Payment(
+            order_id=order.id,
+            amount=payload.amount,
+            method=payload.method,
+            transaction_ref=payload.transaction_ref,
+            status=PaymentStatus.SUCCESS,
+        )
+        db.add(payment)
+
+    # Business Rule: Payment success triggers loyalty points and order completion.
+    if order.status in (OrderStatus.READY, OrderStatus.PREPARING, OrderStatus.CONFIRMED, OrderStatus.PENDING):
+        order.status = OrderStatus.COMPLETED
+        inventory_service.deduct_inventory_for_order(db, order.items)
+
+    if order.customer_id:
+        points = int(float(order.total_amount) // 100) * LOYALTY_POINTS_PER_100
+        if points > 0:
+            customer_service.award_loyalty_points(db, order.customer_id, points, order.id)
+
+    write_audit_log(db, current_user.id, "PAYMENT_PROCESSED", "Payment", payment.id, f"amount={payload.amount}")
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def get_payment(db: Session, order_id: str) -> Payment:
+    order = order_service.get_order(db, order_id)
+    if not order.payment:
+        raise NotFoundException("No payment found for this order")
+    return order.payment
+
+
+def refund_payment(db: Session, order_id: str, current_user) -> Payment:
+    payment = get_payment(db, order_id)
+    if payment.status != PaymentStatus.SUCCESS:
+        raise ConflictException("Only successful payments can be refunded")
+    payment.status = PaymentStatus.REFUNDED
+    write_audit_log(db, current_user.id, "PAYMENT_REFUNDED", "Payment", payment.id)
+    db.commit()
+    db.refresh(payment)
+    return payment
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.schemas.billing import BillPreviewRequest, BillOut, PaymentCreate, PaymentOut
+from app.schemas.order import OrderOut
+from app.schemas.common import SuccessResponse
+from app.services import billing_service
+from app.core.deps import require_cashier
+from app.models.user import User
+
+router = APIRouter(prefix="/billing", tags=["Billing & Payments"])
+
+
+@router.post("/preview", response_model=SuccessResponse[OrderOut], dependencies=[Depends(require_cashier)])
+def preview_bill(payload: BillPreviewRequest, db: Session = Depends(get_db)):
+    order = billing_service.preview_bill(db, payload)
+    return SuccessResponse(message="Bill calculated", data=OrderOut.model_validate(order))
+
+
+@router.post("/pay", response_model=SuccessResponse[PaymentOut], dependencies=[Depends(require_cashier)])
+def pay(payload: PaymentCreate, db: Session = Depends(get_db), current_user: User = Depends(require_cashier)):
+    payment = billing_service.process_payment(db, payload, current_user)
+    return SuccessResponse(message="Payment successful", data=PaymentOut.model_validate(payment))
+
+
+@router.get("/{order_id}/payment", response_model=SuccessResponse[PaymentOut], dependencies=[Depends(require_cashier)])
+def get_payment(order_id: str, db: Session = Depends(get_db)):
+    payment = billing_service.get_payment(db, order_id)
+    return SuccessResponse(data=PaymentOut.model_validate(payment))
+
+
+@router.post("/{order_id}/refund", response_model=SuccessResponse[PaymentOut], dependencies=[Depends(require_cashier)])
+def refund(order_id: str, db: Session = Depends(get_db), current_user: User = Depends(require_cashier)):
+    payment = billing_service.refund_payment(db, order_id, current_user)
+    return SuccessResponse(message="Payment refunded", data=PaymentOut.model_validate(payment))
+from typing import Optional
+from pydantic import BaseModel, EmailStr, Field
+
+from app.models.user import RoleEnum
+
+
+class UserCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=150)
+    email: EmailStr
+    mobile: str = Field(min_length=7, max_length=20)
+    password: str = Field(min_length=8)
+    role: RoleEnum
+
+
+class UserOut(BaseModel):
+    id: str
+    full_name: str
+    email: EmailStr
+    mobile: str
+    role: RoleEnum
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+from typing import Optional
+from pydantic import BaseModel, EmailStr, Field
+
+
+class CustomerCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=150)
+    email: Optional[EmailStr] = None
+    mobile: str = Field(min_length=7, max_length=20)
+
+
+class CustomerUpdate(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    mobile: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class CustomerOut(BaseModel):
+    id: str
+    full_name: str
+    email: Optional[EmailStr] = None
+    mobile: str
+    loyalty_points: int
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class LoyaltyTransactionOut(BaseModel):
+    id: str
+    points: int
+    txn_type: str
+    reference_order_id: Optional[str] = None
+    note: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+from typing import Optional
+from pydantic import BaseModel, EmailStr, Field
+
+from app.models.user import RoleEnum
+
+
+class UserCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=150)
+    email: EmailStr
+    mobile: str = Field(min_length=7, max_length=20)
+    password: str = Field(min_length=8)
+    role: RoleEnum
+
+
+class UserOut(BaseModel):
+    id: str
+    full_name: str
+    email: EmailStr
+    mobile: str
+    role: RoleEnum
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
